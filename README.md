@@ -5,7 +5,7 @@ A Python tool that downloads NiFi flow definitions from a GitHub repo and deploy
 ## Repository Structure
 
 ```
-nipyapi_test/
+openflow_nipyapi/
 ├── .env.example              # Template — copy to .env and fill in your credentials
 ├── .gitignore                # Excludes .env, *.jar, __pycache__ from git
 ├── requirements.txt          # Python dependencies (nipyapi pinned to 1.5.0)
@@ -36,7 +36,7 @@ nipyapi_test/
 - **List deployed flows** — see all flows on a runtime with their status
 - **Multi-runtime support** — list all runtimes, deploy to any by name with `--runtime`
 - **PrivateLink support** — toggle `USE_PRIVATELINK=true` for private connectivity
-- **Configurable runtime host prefix** — `OPENFLOW_HOST_PREFIX` for runtimes on `of2--`, `of3--`, etc.
+- **Runtime URL from Snowflake** — the endpoint is read from `DESCRIBE OPENFLOW RUNTIME` (`server_url`), so no host or prefix configuration is needed
 - **Local-first config** — loads config YAML from local disk first, falls back to GitHub
 
 ---
@@ -122,7 +122,7 @@ Edit `.env` with your real values:
 ```env
 # --- GitHub ---
 GITHUB_PAT=ghp_your_github_token_here
-GITHUB_REPO=sfc-gh-sgope/nipyapi_test
+GITHUB_REPO=sfc-gh-sgope/openflow_nipyapi
 GITHUB_BRANCH=main
 GITHUB_FLOWS_PATH=flows
 
@@ -134,9 +134,6 @@ SNOWFLAKE_ROLE=ACCOUNTADMIN
 
 # --- OpenFlow Runtime (default — can be overridden with --runtime flag) ---
 OPENFLOW_RUNTIME=POSTGRES_DEMO
-
-# Host prefix of the runtime URL (default: of1) — see "Finding your host prefix" below
-# OPENFLOW_HOST_PREFIX=of2
 
 # --- Private Link (optional) ---
 # USE_PRIVATELINK=true
@@ -153,28 +150,38 @@ OPENFLOW_RUNTIME=POSTGRES_DEMO
 | `SNOWFLAKE_PAT` | Yes | Snowflake Programmatic Access Token (the `token_secret` value) |
 | `SNOWFLAKE_ROLE` | No | Role for Snowflake operations (default: `OPENFLOW_ADMIN`) |
 | `OPENFLOW_RUNTIME` | No | Default runtime name (can be overridden with `--runtime`) |
-| `OPENFLOW_HOST_PREFIX` | No | Prefix of the runtime host, e.g. `of1`, `of2` (default: `of1`) |
-| `USE_PRIVATELINK` | No | Set to `true` for PrivateLink accounts |
+| `USE_PRIVATELINK` | No | Set to `true` for PrivateLink accounts (switches the `server_url` domain to `privatelink.snowflakecomputing.app`) |
 
-### Finding your host prefix
+### How the runtime URL is resolved
 
-The script builds the runtime URL as:
+The script never asks you for a URL. For the runtime name you pass, it:
+
+1. Lists runtimes with `SHOW OPENFLOW RUNTIMES IN ACCOUNT`
+2. Reads the runtime's `server_url` with `DESCRIBE OPENFLOW RUNTIME <db>.<schema>.<name>`
+3. Calls the NiFi REST API on the same host and path, with `/nifi-api` in place of `/nifi`
 
 ```
-https://<OPENFLOW_HOST_PREFIX>--<org>-<account>.snowflakecomputing.app/<runtime-key>/nifi-api
+server_url:        https://<host>:443/<runtime-key>/nifi/
+NiFi API endpoint: https://<host>/<runtime-key>/nifi-api
 ```
 
-Open the runtime in Snowsight and look at its URL. If it starts with `of2--`, set `OPENFLOW_HOST_PREFIX=of2`. A wrong prefix shows up as `401 Unauthorized` with `Token introspection returned no principal`, even though the PAT is valid.
+Both URLs are printed on every command.
 
-To check the endpoint and PAT outside the script:
+`DESCRIBE OPENFLOW RUNTIME` requires the **MONITOR** privilege on the runtime for `SNOWFLAKE_ROLE`. Runtimes without it, and suspended runtimes, show `-` in the `list-runtimes` URL column and can't be targeted:
+
+```sql
+GRANT MONITOR ON OPENFLOW RUNTIME <db>.<schema>.<runtime_name> TO ROLE <role>;
+```
+
+To check the endpoint and PAT outside the script, use the printed NiFi API endpoint:
 
 ```bash
 curl -s -o /dev/null -w "%{http_code}\n" \
   -H "Authorization: Bearer $SNOWFLAKE_PAT" \
-  https://of1--<org>-<account>.snowflakecomputing.app/<runtime-key>/nifi-api/flow/process-groups/root
+  https://<host>/<runtime-key>/nifi-api/flow/process-groups/root
 ```
 
-`200` = endpoint and auth OK; `401` = token, role, or wrong host prefix; `403` = role lacks access to the runtime.
+`200` = endpoint and auth OK; `401` = token, role, or wrong endpoint; `403` = role lacks access to the runtime.
 
 ---
 
@@ -188,11 +195,16 @@ python deploy_flow_secure.py list-runtimes
 
 Output:
 ```
+Connecting to Snowflake account: myorg-myaccount
 NAME                      DATABASE        SCHEMA          STATUS       URL
 ------------------------------------------------------------------------------------------------------------------------
-POSTGRES_DEMO             OPENFLOW        OPENFLOW        ACTIVE       https://of1--org-account.snowflakecomputing.app/postgresdemo-100
-SQL_API_TEST              OPENFLOW        OPENFLOW        ACTIVE       https://of1--org-account.snowflakecomputing.app/sqlapitest-100
+DCP_SQLSERVER_DEMO        OPENFLOW        OPENFLOW        SUSPENDED    -
+POSTGRES_DEMO             OPENFLOW        OPENFLOW        ACTIVE       https://of1--myorg-myaccount.snowflakecomputing.app:443/postgresdemo-100/nifi/
+SQL_API_TEST              OPENFLOW        OPENFLOW        ACTIVE       https://of1--myorg-myaccount.snowflakecomputing.app:443/sqlapitest-100/nifi/
+SQL_SERVER_Gen2           OPENFLOW        OPENFLOW        ACTIVE       https://of1--myorg-myaccount.snowflakecomputing.app:443/sqlservergen2-100/nifi/
 ```
+
+The `URL` column is the runtime's `server_url` from `DESCRIBE OPENFLOW RUNTIME`. A `-` means no URL was returned: the runtime is suspended, or `SNOWFLAKE_ROLE` lacks MONITOR on it (see [How the runtime URL is resolved](#how-the-runtime-url-is-resolved)). The script calls the NiFi REST API on the same host with `/nifi-api` in place of `/nifi/`.
 
 ### Deploy a Flow
 
@@ -341,7 +353,7 @@ If the asset already exists on the runtime, the upload is skipped (idempotent).
 
 ```
 Step 1:  Connect to Snowflake, discover runtime by name (SHOW OPENFLOW RUNTIMES IN ACCOUNT)
-Step 2:  Build runtime URL from account locator + runtime key
+Step 2:  Read runtime URL from DESCRIBE OPENFLOW RUNTIME (server_url)
 Step 3:  Load flow JSON (local file first, then GitHub)
 Step 4:  Load config YAML (local file first, then GitHub; optional)
 Step 5:  Validate assets (stage files exist, entries complete)            -- fails before upload
@@ -363,7 +375,8 @@ If any of steps 8-12 fails, the script **rolls back**: it deletes the new proces
 | `404 Not Found` from GitHub | Wrong bucket/flow name or branch | Check file path and case sensitivity (GitHub is case-sensitive) |
 | `401 Network policy is required` | No network policy set for PAT access | Create a network policy with your IP (see Step 3) |
 | `401 Bearer Token malformed` | Wrong value in `SNOWFLAKE_PAT` | Use the PAT `token_secret`; check for stray quotes or line breaks in `.env` |
-| `401 Unauthorized` — `Token introspection returned no principal` | Wrong runtime host prefix (e.g. runtime is on `of2--`) | Set `OPENFLOW_HOST_PREFIX` in `.env` (see "Finding your host prefix") |
+| `401 Unauthorized` — `Token introspection returned no principal` | Request isn't reaching the runtime's endpoint, or the token can't be mapped to a user/role for it | Compare the printed NiFi API endpoint with `server_url` from `DESCRIBE OPENFLOW RUNTIME`; then check the PAT, its role restriction, and network policy |
+| `Runtime '...' has no server_url` | Runtime is suspended, or `SNOWFLAKE_ROLE` lacks MONITOR on it | Resume the runtime, or `GRANT MONITOR ON OPENFLOW RUNTIME ... TO ROLE ...` |
 | `401 Unauthorized` | PAT expired or invalid | Regenerate the Snowflake PAT |
 | `403 Forbidden` on runtime | PAT role doesn't have access | Check role grants or use `--runtime` to target a different runtime |
 | `Connection refused` | Runtime is suspended | Resume: `ALTER OPENFLOW RUNTIME <db>.<schema>.<name> RESUME` |

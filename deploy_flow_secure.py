@@ -57,8 +57,6 @@ SNOWFLAKE_PAT = os.environ["SNOWFLAKE_PAT"].strip()
 SNOWFLAKE_ROLE = os.environ.get("SNOWFLAKE_ROLE", "OPENFLOW_ADMIN").strip()
 OPENFLOW_RUNTIME = os.environ.get("OPENFLOW_RUNTIME", "").strip()
 USE_PRIVATELINK = os.environ.get("USE_PRIVATELINK", "false").strip().lower() == "true"
-# Host prefix of the OpenFlow runtime URL (e.g. of1, of2) — check the runtime URL in Snowsight
-OPENFLOW_HOST_PREFIX = os.environ.get("OPENFLOW_HOST_PREFIX", "of1").strip().lower()
 
 GITHUB_HEADERS = {"Accept": "application/vnd.github.v3+json"}
 if GITHUB_PAT:  # not needed for public repos
@@ -79,14 +77,25 @@ def _get_snowflake_connection():
     )
 
 
-def _get_account_locator(cur):
-    cur.execute("SELECT LOWER(CURRENT_ORGANIZATION_NAME() || '-' || CURRENT_ACCOUNT_NAME())")
-    return cur.fetchone()[0].replace("_", "-")
+def _quote_ident(name):
+    return '"%s"' % name.replace('"', '""')
 
 
-def _build_runtime_url(account_locator, runtime_key):
-    domain = "privatelink.snowflakecomputing.app" if USE_PRIVATELINK else "snowflakecomputing.app"
-    return "https://%s--%s.%s/%s" % (OPENFLOW_HOST_PREFIX, account_locator, domain, runtime_key)
+def _get_server_url(cur, runtime):
+    """Read the runtime's endpoint from DESCRIBE OPENFLOW RUNTIME (server_url). Returns None if unavailable."""
+    fqn = ".".join(_quote_ident(runtime[k]) for k in ("database_name", "schema_name", "name"))
+    try:
+        cur.execute("DESCRIBE OPENFLOW RUNTIME %s" % fqn)
+        row = cur.fetchone()
+    except snowflake.connector.errors.ProgrammingError as e:
+        print("  WARNING: DESCRIBE OPENFLOW RUNTIME %s failed: %s" % (fqn, e.msg), file=sys.stderr)
+        return None
+    if not row:
+        return None
+    url = dict(zip([d[0].lower() for d in cur.description], row)).get("server_url") or None
+    if url and USE_PRIVATELINK and ".privatelink.snowflakecomputing.app" not in url:
+        url = url.replace(".snowflakecomputing.app", ".privatelink.snowflakecomputing.app", 1)
+    return url
 
 
 def get_all_runtimes():
@@ -97,11 +106,10 @@ def get_all_runtimes():
         cur.execute("SHOW OPENFLOW RUNTIMES IN ACCOUNT")
         rows = cur.fetchall()
         columns = [desc[0].lower() for desc in cur.description]
-        account_locator = _get_account_locator(cur)
         runtimes = []
         for row in rows:
             r = dict(zip(columns, row))
-            r["url"] = _build_runtime_url(account_locator, r["key"])
+            r["url"] = _get_server_url(cur, r)
             runtimes.append(r)
         return runtimes
     finally:
@@ -117,6 +125,9 @@ def resolve_runtime_url(runtime_name):
             ))
             if r["status"] != "ACTIVE":
                 print("WARNING: Runtime is %s, not ACTIVE." % r["status"], file=sys.stderr)
+            if not r["url"]:
+                raise ValueError("Runtime '%s' has no server_url in DESCRIBE OPENFLOW RUNTIME %s.%s.%s" % (
+                    r["name"], r["database_name"], r["schema_name"], r["name"]))
             print("Runtime URL: %s" % r["url"])
             return r["url"]
     available = ", ".join("%s (%s)" % (r["name"], r["status"]) for r in runtimes)
@@ -432,7 +443,9 @@ def add_inherited_contexts(pg_id, context_names):
 # ──────────────────────────────────────────────
 
 def connect_to_runtime(runtime_url):
-    base = re.sub(r"/nifi-api/?$", "", re.sub(r"/nifi/?$", "", runtime_url.rstrip("/")))
+    # server_url looks like https://<host>:443/<runtime-key>/nifi/ — the REST API is at .../nifi-api
+    base = re.sub(r":443(?=/|$)", "", runtime_url.rstrip("/"))
+    base = re.sub(r"/nifi-api/?$", "", re.sub(r"/nifi/?$", "", base))
     nifi_api_url = base + "/nifi-api"
     nipyapi.config.nifi_config.host = nifi_api_url
     nipyapi.security.set_service_auth_token(service="nifi", token=SNOWFLAKE_PAT)
@@ -920,7 +933,7 @@ def cmd_list_runtimes(args):
     print("%-25s %-15s %-15s %-12s %s" % ("NAME", "DATABASE", "SCHEMA", "STATUS", "URL"))
     print("-" * 120)
     for r in runtimes:
-        print("%-25s %-15s %-15s %-12s %s" % (r["name"], r["database_name"], r["schema_name"], r["status"], r["url"]))
+        print("%-25s %-15s %-15s %-12s %s" % (r["name"], r["database_name"], r["schema_name"], r["status"], r["url"] or "-"))
 
 def cmd_list_flows(args):
     _connect_to_named_runtime(_get_runtime_name(args))
